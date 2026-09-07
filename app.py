@@ -177,7 +177,7 @@ def parse_address_with_gemini(address: str) -> AddressParseResult:
 
     try:
         response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.6-flash",
             contents=ADDRESS_PARSE_PROMPT + address,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
