@@ -4,6 +4,8 @@ import numpy as np
 import pandas as pd
 
 from fastapi import FastAPI, HTTPException, Header
+from google import genai
+from google.genai import types
 from pydantic import BaseModel
 from supabase import create_client
 
@@ -26,6 +28,7 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get(
     "SUPABASE_SERVICE_ROLE_KEY"
 )
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 if not SUPABASE_URL:
     raise RuntimeError(
@@ -45,6 +48,14 @@ if not SUPABASE_SERVICE_ROLE_KEY:
 supabase = create_client(
     SUPABASE_URL,
     SUPABASE_SERVICE_ROLE_KEY,
+)
+
+gemini_client = (
+    genai.Client(
+        api_key=GEMINI_API_KEY
+    )
+    if GEMINI_API_KEY
+    else None
 )
 
 
@@ -74,6 +85,22 @@ class DemandPredictionRequest(BaseModel):
     commodity_id: str
 
 
+class AddressRequest(BaseModel):
+    address: str
+
+
+class AddressParseResult(BaseModel):
+    province: str | None = None
+    city: str | None = None
+    district: str | None = None
+    needs_confirmation: bool
+    reason: str
+
+
+class AddressResponse(AddressParseResult):
+    address_original: str
+
+
 # =========================================================
 # HEALTH CHECK
 # =========================================================
@@ -94,6 +121,122 @@ def health():
         "model_loaded": True,
         "supabase_connected": True,
     }
+
+
+# =========================================================
+# PARSE ADDRESS ENDPOINT
+# =========================================================
+
+ADDRESS_PARSE_PROMPT = """
+Ekstrak alamat Indonesia berikut ke struktur administratif.
+
+Aturan:
+- province adalah nama Provinsi.
+- city adalah nama Kabupaten atau Kota, termasuk awalan "Kabupaten" atau "Kota"
+  bila itu bagian dari nama wilayah yang normal.
+- district adalah nama Kecamatan tanpa awalan "Kecamatan".
+- Gunakan nama wilayah Indonesia yang normal dan konsisten.
+- Jangan menebak. Jika provinsi tidak dapat ditentukan dengan aman, isi province
+  dengan null dan needs_confirmation dengan true.
+- city atau district boleh null jika tidak tersedia dari alamat.
+- needs_confirmation harus true bila alamat ambigu atau informasi penting tidak
+  cukup untuk mengidentifikasi wilayah secara aman.
+- Jangan mengarang confidence numerik.
+- reason harus singkat dalam bahasa Indonesia.
+
+Kembalikan hanya data terstruktur sesuai schema, tanpa markdown:
+{
+  "province": string|null,
+  "city": string|null,
+  "district": string|null,
+  "needs_confirmation": boolean,
+  "reason": string
+}
+
+Alamat:
+"""
+
+
+def _clean_address_value(value: str | None):
+    if value is None:
+        return None
+
+    value = value.strip()
+    return value or None
+
+
+def parse_address_with_gemini(address: str) -> AddressParseResult:
+    if gemini_client is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Gemini is not configured: "
+                "GEMINI_API_KEY environment variable is missing"
+            ),
+        )
+
+    try:
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=ADDRESS_PARSE_PROMPT + address,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=AddressParseResult,
+                temperature=0,
+            ),
+        )
+
+        parsed = response.parsed
+        if parsed is None:
+            raise ValueError("Gemini returned no structured address data")
+
+        if isinstance(parsed, AddressParseResult):
+            result = parsed
+        else:
+            result = AddressParseResult(**parsed)
+
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Address parsing with Gemini failed: {error}",
+        )
+
+    result.province = _clean_address_value(result.province)
+    result.city = _clean_address_value(result.city)
+    result.district = _clean_address_value(result.district)
+
+    if result.province is None:
+        result.needs_confirmation = True
+
+    return result
+
+
+@app.post("/parse-address", response_model=AddressResponse)
+def parse_address(request: AddressRequest):
+    address = request.address.strip()
+    if not address:
+        raise HTTPException(
+            status_code=422,
+            detail="address must not be empty",
+        )
+
+    if len(address) < 3 or len(address.split()) == 1:
+        return AddressResponse(
+            address_original=address,
+            province=None,
+            city=None,
+            district=None,
+            needs_confirmation=True,
+            reason="Alamat belum cukup spesifik",
+        )
+
+    result = parse_address_with_gemini(address)
+    return AddressResponse(
+        address_original=address,
+        **result.model_dump(),
+    )
 
 
 # =========================================================
